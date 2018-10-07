@@ -2,10 +2,12 @@
 from airtest import aircv
 from airtest.core.device import Device
 from pywinauto.application import Application
-from pywinauto.win32functions import SetForegroundWindow  # ,SetProcessDPIAware
+from pywinauto.win32functions import SetForegroundWindow, GetSystemMetrics  # ,SetProcessDPIAware
+from pywinauto.win32structures import RECT
 from pywinauto import mouse, keyboard
 from functools import wraps
 from .screen import screenshot
+import socket
 import time
 import subprocess
 
@@ -147,7 +149,6 @@ class Windows(Device):
         self.keyevent(text)
 
     def touch(self, pos, **kwargs):
-    # def touch(self, pos, times=1, duration=0.01):
         """
         Perform mouse click action
 
@@ -162,20 +163,18 @@ class Windows(Device):
             None
 
         """
-        # self.mouse.click(coords=self._action_pos(pos), **kwargs)
         duration = kwargs.get("duration", 0.01)
-        times = kwargs.get("times", 1)
         right_click = kwargs.get("right_click", False)
         button = "right" if right_click else "left"
         coords = self._action_pos(pos)
-        print(coords)
 
-        if times > 1:
-            self.mouse.double_click(coords=coords)
-        else:
-            self.mouse.press(button=button, coords=coords)
-            time.sleep(duration)
-            self.mouse.release(button=button, coords=coords)
+        self.mouse.press(button=button, coords=coords)
+        time.sleep(duration)
+        self.mouse.release(button=button, coords=coords)
+
+    def double_click(self, pos):
+        coords = self._action_pos(pos)
+        self.mouse.double_click(coords=coords)
 
     def swipe(self, p1, p2, duration=0.8, steps=5):
         """
@@ -207,7 +206,7 @@ class Windows(Device):
         time.sleep(interval)
         self.mouse.release(coords=(to_x, to_y))
 
-    def start_app(self, path):
+    def start_app(self, path, *args):
         """
         Start the application
 
@@ -244,16 +243,18 @@ class Windows(Device):
         """
         SetForegroundWindow(self._top_window)
 
-    @require_app
     def get_rect(self):
         """
         Get rectangle
 
         Returns:
-            None
+            win32structures.RECT
 
         """
-        return self._top_window.rectangle()
+        if self.app and self._top_window:
+            return self._top_window.rectangle()
+        else:
+            return RECT(right=GetSystemMetrics(0), bottom=GetSystemMetrics(1))
 
     @require_app
     def get_title(self):
@@ -344,3 +345,12 @@ class Windows(Device):
         pos = (int((pos[0] + rect.left + self._focus_rect[0]) * self._dpifactor), 
             int((pos[1] + rect.top + self._focus_rect[1]) * self._dpifactor))
         return pos
+
+    def get_ip_address(self):
+        """
+        Return default external ip address of the windows os.
+
+        Returns:
+             :py:obj:`str`: ip address
+        """
+        return socket.gethostbyname(socket.gethostname())

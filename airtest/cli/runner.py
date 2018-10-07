@@ -3,14 +3,14 @@
 import unittest
 import os
 import sys
+import six
 import re
 import shutil
 import traceback
 import warnings
 from io import open
-from airtest.core.api import G, auto_setup
+from airtest.core.api import G, auto_setup, log
 from airtest.core.settings import Settings as ST
-from airtest.core.helper import log
 from airtest.utils.compat import decode_path
 from copy import copy
 
@@ -49,7 +49,6 @@ class AirtestCase(unittest.TestCase):
                     traceback.print_exc()
 
     def runTest(self):
-        log("main_script", {"script": self.args.script})
         scriptpath = self.args.script
         pyfilename = os.path.basename(scriptpath).replace(self.SCRIPTEXT, ".py")
         pyfilepath = os.path.join(scriptpath, pyfilename)
@@ -58,7 +57,13 @@ class AirtestCase(unittest.TestCase):
         with open(pyfilepath, 'r', encoding="utf8") as f:
             code = f.read()
         pyfilepath = pyfilepath.encode(sys.getfilesystemencoding())
-        exec(compile(code.encode("utf-8"), pyfilepath, 'exec'), self.scope)
+
+        try:
+            exec(compile(code.encode("utf-8"), pyfilepath, 'exec'), self.scope)
+        except Exception as err:
+            tb = traceback.format_exc()
+            log("Final Error", tb)
+            six.reraise(*sys.exc_info())
 
     @classmethod
     def exec_other_script(cls, scriptpath):

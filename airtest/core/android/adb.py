@@ -1,16 +1,15 @@
-
 # -*- coding: utf-8 -*-
 import os
-import platform
-import random
 import re
-import subprocess
 import sys
-import threading
 import time
+import random
+import platform
 import warnings
+import subprocess
+import threading
 
-from six import PY3, text_type
+from six import PY3, text_type, binary_type
 from six.moves import reduce
 
 from airtest.core.android.constant import (DEFAULT_ADB_PATH, IP_PATTERN,
@@ -23,7 +22,6 @@ from airtest.utils.nbsp import NonBlockingStreamReader
 from airtest.utils.retry import retries
 from airtest.utils.snippet import get_std_encoding, reg_cleanup, split_cmd
 
-# LOGGING = get_logger('adb')
 LOGGING = get_logger(__name__)
 
 
@@ -42,7 +40,7 @@ class ADB(object):
         self.connect()
         self._sdk_version = None
         self._line_breaker = None
-        self._display_info = None
+        self._display_info = {}
         self._display_info_lock = threading.Lock()
         self._forward_local_using = []
         self.__class__._instances.append(self)
@@ -57,7 +55,13 @@ class ADB(object):
 
         """
         system = platform.system()
-        adb_path = DEFAULT_ADB_PATH[system]
+        machine = platform.machine()
+        adb_path = DEFAULT_ADB_PATH.get('{}-{}'.format(system, machine))
+        if not adb_path:
+            adb_path = DEFAULT_ADB_PATH.get(system)
+        if not adb_path:
+            raise RuntimeError("No adb executable supports this platform({}-{}).".format(system, machine))
+
         # overwrite uiautomator adb
         if "ANDROID_HOME" in os.environ:
             del os.environ["ANDROID_HOME"]
@@ -174,7 +178,10 @@ class ADB(object):
 
         if proc.returncode > 0:
             # adb connection error
-            if re.search(DeviceConnectionError.DEVICE_CONNECTION_ERROR, stderr):
+            pattern = DeviceConnectionError.DEVICE_CONNECTION_ERROR
+            if isinstance(stderr, binary_type):
+                pattern = pattern.encode("utf-8")
+            if re.search(pattern, stderr):
                 raise DeviceConnectionError(stderr)
             else:
                 raise AdbError(stdout, stderr)
@@ -558,6 +565,43 @@ class ADB(object):
 
         return out
 
+    def install_multiple_app(self, filepath, replace=False):
+        """
+            Perform `adb install-multiple` command
+
+            Args:
+                filepath: full path to file to be installed on the device
+                replace: force to replace existing application, default is False
+
+            Returns:
+                command output
+        """
+        if isinstance(filepath, str):
+            filepath = decode_path(filepath)
+
+        if not os.path.isfile(filepath):
+            raise RuntimeError("file: %s does not exists" % (repr(filepath)))
+
+        if not replace:
+            cmds = ["install-multiple", filepath]
+        else:
+            cmds = ["install-multiple", "-r", filepath]
+
+        try:
+            out = self.cmd(cmds)
+        except AdbError as err:
+            if "UNSUPPORTED" in err.stderr or "Failed to create session" in err.stderr:
+                return self.install_app(filepath, replace)
+            elif "Failed to finalize session" in err.stderr:
+                return "Success"
+            raise err
+
+        if re.search(r"Failure \[.*?\]", out):
+            print(out)
+            raise AirtestError("Installation Failure")
+
+        return out
+
     def pm_install(self, filepath, replace=False):
         """
         Perform `adb push` and `adb install` commands
@@ -720,12 +764,12 @@ class ADB(object):
         except AdbShellError:
             return False
         else:
-            return not("No such file or directory" in out)
+            return not ("No such file or directory" in out)
 
     def file_size(self, filepath):
         """
         Get the file size
-        
+
         Args:
             filepath: path to the file
 
@@ -735,7 +779,6 @@ class ADB(object):
         out = self.shell(["ls", "-l", filepath])
         file_size = int(out.split()[3])
         return file_size
-
 
     def _cleanup_forwards(self):
         """
@@ -763,7 +806,7 @@ class ADB(object):
                 line_breaker = os.linesep
             else:
                 line_breaker = '\r' + os.linesep
-            self._line_breaker = line_breaker
+            self._line_breaker = line_breaker.encode("ascii")
         return self._line_breaker
 
     @property
@@ -900,7 +943,6 @@ class ADB(object):
                 displayInfo[prop] = float(m.group(prop))
             return displayInfo
 
-
     def _getDisplayDensity(self, key, strip=True):
         """
         Get display density
@@ -946,8 +988,8 @@ class ADB(object):
             return int(m.group(1))
 
         # We couldn't obtain the orientation
-        warnings.warn("Guess orientation by height > width")
-        return 0 if self.display_info["height"] > self.display_info['width'] else 1
+        warnings.warn("Could not obtain the orientation, return 0")
+        return 0
 
     def get_top_activity(self):
         """
@@ -1141,6 +1183,29 @@ class ADB(object):
         else:
             self.shell(['am', 'start', '-n', '%s/%s.%s' % (package, package, activity)])
 
+    def start_app_timing(self, package, activity):
+        """
+        Start the application and activity, and measure time
+
+        Args:
+            package: package name
+            activity: activity name
+
+        Returns:
+            app launch time
+
+        """
+        out = self.shell(['am', 'start', '-S', '-W', '%s/%s' % (package, activity),
+                          '-c', 'android.intent.category.LAUNCHER', '-a', 'android.intent.action.MAIN'])
+        if not re.search(r"Status:\s*ok", out):
+            raise AirtestError("Starting App: %s/%s Failed!" % (package, activity))
+
+        matcher = re.search(r"TotalTime:\s*(\d+)", out)
+        if matcher:
+            return int(matcher.group(1))
+        else:
+            return 0
+
     def stop_app(self, package):
         """
         Perform `adb shell am force-stop` command to force stop the application
@@ -1178,29 +1243,38 @@ class ADB(object):
             None if no IP address has been found, otherwise return the IP address
 
         """
-        try:
-            res = self.shell('netcfg')
-        except AdbShellError:
-            res = ''
-        matcher = re.search(r'wlan0.* ((\d+\.){3}\d+)/\d+', res)
-        if matcher:
-            return matcher.group(1)
-        else:
+
+        def get_ip_address_from_interface(interface):
             try:
-                res = self.shell('ifconfig')
+                res = self.shell('netcfg')
             except AdbShellError:
                 res = ''
-            matcher = re.search(r'wlan0.*?inet addr:((\d+\.){3}\d+)', res, re.DOTALL)
+            matcher = re.search(interface + r'.* ((\d+\.){3}\d+)/\d+', res)
             if matcher:
                 return matcher.group(1)
             else:
                 try:
-                    res = self.shell('getprop dhcp.wlan0.ipaddress')
+                    res = self.shell('ifconfig')
                 except AdbShellError:
                     res = ''
-                matcher = IP_PATTERN.search(res)
+                matcher = re.search(interface + r'.*?inet addr:((\d+\.){3}\d+)', res, re.DOTALL)
                 if matcher:
-                    return matcher.group(0)
+                    return matcher.group(1)
+                else:
+                    try:
+                        res = self.shell('getprop dhcp.{}.ipaddress'.format(interface))
+                    except AdbShellError:
+                        res = ''
+                    matcher = IP_PATTERN.search(res)
+                    if matcher:
+                        return matcher.group(0)
+            return None
+
+        interfaces = ('eth0', 'eth1', 'wlan0')
+        for i in interfaces:
+            ip = get_ip_address_from_interface(i)
+            if ip and not ip.startswith('172.') and not ip.startswith('127.') and not ip.startswith('169.'):
+                return ip
         return None
 
     def get_gateway_address(self):
@@ -1264,16 +1338,16 @@ class ADB(object):
 
     def get_storage(self):
         res = self.shell("df /data")
-        pat = re.compile(r".*\/data\s+(\S+)",re.DOTALL)
+        pat = re.compile(r".*\/data\s+(\S+)", re.DOTALL)
         if pat.match(res):
             _str = pat.match(res).group(1)
         else:
-            pat = re.compile(r".*\s+(\S+)\s+\S+\s+\S+\s+\S+\s+\/data",re.DOTALL)
+            pat = re.compile(r".*\s+(\S+)\s+\S+\s+\S+\s+\S+\s+\/data", re.DOTALL)
             _str = pat.match(res).group(1)
         if 'G' in _str:
             _num = round(float(_str[:-1]))
         elif 'M' in _str:
-            _num = round(float(_str[:-1])/1000.0)
+            _num = round(float(_str[:-1]) / 1000.0)
         else:
             _num = round(float(_str) / 1000.0 / 1000.0)
         if _num > 64:
@@ -1296,7 +1370,7 @@ class ADB(object):
         if not m:
             pat = re.compile(r'Processor\s+:\s+(\w+.*)')
             m = pat.match(res)
-        cpuName = m.group(1).replace('\r','')
+        cpuName = m.group(1).replace('\r', '')
         return dict(cpuNum=cpuNum, cpuName=cpuName)
 
     def get_cpufreq(self):
@@ -1319,7 +1393,7 @@ class ADB(object):
         if len(_list) > 1:
             m2 = re.search(r'(\S+\s+\S+\s+\S+).*', _list[2])
             if m2:
-               opengl = m2.group(1)
+                opengl = m2.group(1)
         return dict(gpuModel=gpuModel, opengl=opengl)
 
     def get_model(self):
